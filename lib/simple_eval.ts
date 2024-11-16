@@ -63,7 +63,7 @@ interface TokenValues {
   [T.compare1]: "==" | "!=" | "===" | "!==", [T.compare2]: "<" | "<=" | ">" | ">=" | "in" | "instanceof"
   [T.bitMove]: "<<" | ">>" | ">>>", [T.math1]: "+" | "-", [T.math2]: "*" | "/" | "%", [T.math3]: "**"
   [T.unary]: "+" | "-" | "!" | "~" | "typeof" | "void" | "delete" | "++" | "--" | "`", [T.rightUnary]: "++" | "--"
-  [T.callOrAccess]: "new" | "?." | "__call__", [T.dot]: "." | "?."
+  [T.callOrAccess]: "new" | "?." | "(", [T.dot]: "." | "?."
   [T.literal]: BaseLiteralOp<L.plain>["x"] | SomeLiterals<Exclude<L, L.plain>>, [T.ref]: VarLiterals
 }
 interface BaseToken<K extends keyof TokenValues> { readonly t: K; readonly v: TokenValues[K];
@@ -85,7 +85,7 @@ type AllStatPrefix = "" | BlockPrefixes | LineActions
 interface BaseStatementOp<T extends AllStatPrefix | "arg"> extends CoreOp<O.stat> {
   readonly q: T
   readonly x: T extends "if" | "else if" | "while" | "switch" | "case" ? ExprLikeOps
-      : T extends "catch" ? RefOp | null
+      : T extends "catch" ? RefOp | DestructuringComposedOp | null
       : T extends "for" ? CoreOp<O.block> & {
           readonly q: readonly [SomeStatementOps<VarActions> | ExprLikeOps, ExprLikeOps, ExprLikeOps]
               | readonly [SomeStatementOps<VarActions> | RefAssignOp]
@@ -115,7 +115,8 @@ interface OpValues {
                   readonly /** body */ x: ExprLikeOps | StorableBlockOp & {
                     readonly /** $builtins */ y: [ $this: number, $arguments:number, $newTarget: number ] | null }
                   readonly y: CoreOp<O.fnDesc> & OpValues[O.fnDesc] },
-  [O.composed]: { readonly q: readonly (ExprLikeOps | PairOp)[], readonly x: "[" | "{", readonly/**$simple*/y:null|0|1},
+  [O.composed]: { readonly q: readonly (ExprLikeOps | PairOp)[], readonly x: "[" | "{",
+                  readonly /**$simple*/ y: null | BOOL | AnalysedVars },
   [O.assign]:   { readonly /** binary op token */ q: TokenValues[T.assign],
                   readonly /** source (right value) */ x: ExprLikeOps, readonly /** target (left-v) */ y: ExprLikeOps }
   [O.ifElse]:   { readonly /** condition */ q: ExprLikeOps,
@@ -130,7 +131,7 @@ interface OpValues {
   [O.ref]:      { readonly q: VarName, readonly x: number | null, readonly y: number | null }
   [O.fnDesc]:   ( { readonly q: "fn _", readonly x: RefOp } | { readonly q: "fn", readonly x: RefOp | null }
                   | { readonly q: "(){", readonly x: VarName | PairOp } | { readonly q: "=>", readonly x: null })
-                & { readonly /** $analysed */ y: AnalysedVars | null }
+                & { readonly /** $analysed */ y: AnalysedVars }
 }
 type KStatLikeO = O.block | O.stats | O.stat
 type kExprO = Exclude<keyof OpValues, KStatLikeO | O.pair | O.fnDesc>
@@ -143,7 +144,16 @@ type StatLikeOps = SomeOps<KStatLikeO>
 type EvaluatableOps = ExprLikeOps | StatLikeOps
 type PairOp = BaseOp<O.pair>
 type RefOp = BaseOp<O.ref>
-interface RefAssignOp extends BaseOp<O.assign> { readonly y: RefOp }
+type ArrayHoleOp = BaseLiteralOp<L.array_hole>
+interface DestructurePairOp extends BaseOp<O.pair> { readonly x: DeclareOp; readonly y: null }
+interface RefAssignOp extends BaseOp<O.assign> { readonly y: RefOp | DestructuringComposedOp }
+interface PlainRefAssignOp extends RefAssignOp { readonly y: RefOp }
+interface BaseDestructuringComposedOp<T extends "[" | "{"> extends BaseOp<O.composed> {
+  readonly q: readonly (T extends "[" ? DeclareOp | ArrayHoleOp : RefOp | PlainRefAssignOp | DestructurePairOp)[]
+  readonly x: T
+  readonly y: AnalysedVars
+}
+type DestructuringComposedOp = BaseDestructuringComposedOp<"["> | BaseDestructuringComposedOp<"{">
 type DeclareOp = RefOp | RefAssignOp
 interface TemplateOp extends BaseOp<O.unary> { readonly q: "`", readonly x: ConcreteX<O.composed, { x: "[" }> }
 type StorableBlockOp = Omit<BaseOp<O.block>, "y">
@@ -200,7 +210,7 @@ let g_exc: { g: Isolate, l: StackFrame[], d: number } | null = null
 const kTokenNames = Build.NDEBUG ? [] as never
     : ("block, blockEnd, semiColon, prefix, action, group, dict, array, groupEnd, comma, question, colon, fn, assign"
     + ", or, and, bitOr, bitXor, bitAnd, compare1, compare2, bitMove, math1, math2, math3"
-    + ", unary, rightUnary, callOrAccess, dot, ref, literal").split(", ")
+    + ", unary, rightUnary, callOrAccess, dot, literal, ref").split(", ")
 const kOpNames = Build.NDEBUG ? [] as never
   : "block,stats,stat,comma,pair,fn,assign,ifElse,binary,unary,call,access,composed,literal,ref,fnDesc".split(",")
 
@@ -213,7 +223,7 @@ const kLabelled = "labelled", kProto = "__proto__", kDots = "..."
 //#region helper functions
 
 const Op = ((o: O, q: unknown, x: unknown, y: unknown): BaseOp<O>=>{
-  return (NDEBUG ? { o, q, x, y } : { n: o === O.composed ? q === "{"
+  return (NDEBUG ? { o, q, x, y } : { n: o === O.composed ? x as OpValues[O.composed]["x"] === "{"
         ? "dict" : "array" : kOpNames[o], q, x, y, o }) as BaseOp<O>
 }) as {
   <O extends Exclude<keyof OpValues, O.stat | O.literal>> (
@@ -323,7 +333,7 @@ const splitTokens = (ori_expression: string): Token[] => {
       // not update `before` here
       expect(char !== kCharCode.slash ? /^\s+/ : /^\/\/[^\n]*|^\/\*[^]*?\*\//)
       before & (T.blockEnd | T.action | T.groupEnd | T.rightUnary | T.literal | T.ref) && char !== kCharCode.slash
-          && (<RegExpOne> /[\n\r\u2028\u2029]/).test(last_) && tokens_.push(Token(T.semiColon, "\n"))
+          && (<RegExpOne> /[\n\u2028\u2029]/).test(last_) && tokens_.push(Token(T.semiColon, "\n"))
       continue
     }
     if (char === kCharCode.slash && allowRegexp
@@ -404,11 +414,6 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
   type CtxTokens = ControlTokens | BinaryTokens | UnaryTokens | BeginGroupTokens
   const ctx_: SomeTokens<CtxTokens>[] = [ Token(T.block, "{") ]
   const values_: (EvaluatableOps | PairOp)[] = [Op(O.block, null as never, null, null)]
-  const extractMemberPrefix = (): "get" | "set" | null => {
-    const mayPrefix = values_[values_.length - 1] as BaseOp<O.comma> | RefOp, isToken = mayPrefix.o === O.ref
-    return isToken && (ctx_[ctx_.length - 1].t === T.dict || values_[values_.length - 2].o !== O.composed)
-        ? (values_.length--, mayPrefix.q as "get" | "set") : null
-  }
   const consumeUntil = (except: number): void => { while (!(ctx_[ctx_.length - 1].t & except)) { consume() } }
   const tryInsertPrefix = (toInsert: BlockPrefixes, offset: number
       ): BaseOp<O.stats> | ConcreteY<O.stat, { y: SomeOps<O.stat> }> | null | false => {
@@ -442,7 +447,6 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
       } break
     case T.prefix: /* T.prefix: */ {
       const clause = values_[values_.length - 1].o !== O.block ? values_.pop()! : null
-      if (clause && top.v === "catch" && clause.o !== O.ref) { throwSyntax("Unsupported destructuring") }
       values_.length--
       const matched = ctx_[ctx_.length - 1].t & ~(T.prefix | T.group) ? tryInsertPrefix(top.v, 1) : false
       let stat = matched !== false && top.v === "while" ? Op(O.stat, top.v, val as ExprLikeOps, Op(O.comma, [], 0, 0))
@@ -471,8 +475,9 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
             , values_.pop() as ExprLikeOps, newTop.v === "new"
             || (ctx_[ctx_.length - 1].t === T.callOrAccess && (ctx_.length--, true))
             ? "new" : newTop.v === "?." ? "?.(" : "()"))
-        : values_.push(Op(O.access, newTop.v === "?." ? "?.[" : "[", values_.pop()! as ExprLikeOps, val.o === O.literal
-            && val.q === L.plain ? val.x satisfies string | number | boolean | null ?? val : val as ExprLikeOps))
+        : (values_[values_.length - 1] = Op(O.access, newTop.v === "?." ? "?.[" : "["
+            , values_[values_.length - 1] as ExprLikeOps, val.o === O.literal && val.q === L.plain
+              ? val.x satisfies string | number | boolean | null ?? val : val as ExprLikeOps))
       } else if (top.t !== T.group) {
         let arr = val.o === O.comma ? val.q : [val as ExprLikeOps]
         if (top.t === T.array) {
@@ -491,7 +496,7 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
     case T.comma: /* T.comma: */ {
       const prevVal = values_[values_.length - 1]
       prevVal.o === O.comma ? (prevVal as WritableOp2<O.comma>).q.push(val)
-          : values_.push(Op(O.comma, [values_.pop()!, val], 0, 0))
+          : (values_[values_.length - 1] = Op(O.comma, [values_[values_.length - 1], val], 0, 0))
       } break
     case T.question: if (!Build.NDEBUG) { throwSyntax(`Unexpected "?"`) } break
     case T.colon: /* T.colon: */
@@ -499,52 +504,52 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
         throwSyntax(`Unexpected op token #${ctx_[ctx_.length - 1].t} before ":"`)
       }
       if (ctx_[ctx_.length - 1].t & (T.dict | T.comma)) {
-        const keyOp = values_.pop()! as SomeOps<O.ref | O.literal | O.composed>
+        const keyOp = values_[values_.length - 1] as SomeOps<O.ref | O.literal | O.composed>
         !Build.NDEBUG && !((1 << keyOp.o) & (1 << O.ref | 1 << O.literal | 1 << O.composed))
             && throwSyntax('Unexpected ":" in an object literal')
-        const prefix = extractMemberPrefix();
+        const mayPrefix = values_[values_.length - 2] as BaseOp<O.comma> | RefOp, isToken = mayPrefix.o === O.ref
+        const prefix = isToken && (ctx_[ctx_.length - 1].t === T.dict || values_[values_.length - 3].o !== O.composed)
+            ? (values_.length--, mayPrefix.q as "get" | "set") : null
         const key = keyOp.o === O.ref ? keyOp.q : keyOp.o === O.literal
             ? (!Build.NDEBUG && keyOp.q !== L.plain && keyOp.q !== L.bigint
                 && throwSyntax(`Unexpected dict key: ${keyOp.q}, ${keyOp.x}`),<SomeLiteralOps<L.plain | L.bigint>>keyOp)
             : Op(O.comma, keyOp.q, 0, 0)
-        values_.push(Op(O.pair, key, val as ExprLikeOps, prefix))
+        values_[values_.length - 1] = Op(O.pair, key, val as ExprLikeOps, prefix)
         val.o === O.fn && val.y.q === "(){" && ((val as WritableOp2<O.fn>).y.x
             = keyOp.o === O.ref && !prefix ? <typeof keyOp.q>key :Op(O.pair,key,Op(O.literal,L.plain,null,null),prefix))
       } else {
         ctx_.length--
         const thenVal = values_.pop()!
-        values_.push(Op(O.ifElse, values_.pop() as ExprLikeOps, thenVal as ExprLikeOps, val as ExprLikeOps))
+        values_[values_.length - 1] = Op(O.ifElse, values_[values_.length - 1] as ExprLikeOps
+            , thenVal as ExprLikeOps, val as ExprLikeOps)
       }
       break
     case T.fn: /* T.fn: */ {
       const rawArgs = values_.pop()!
-      const args = (rawArgs.o === O.comma ? rawArgs.q : [rawArgs]).filter((i): i is DeclareOp =>
-          i.o === O.ref || i.o === O.assign && i.y.o === O.ref
-          || throwSyntax(`Unsupported destructuring parameters`))
+      const args = (rawArgs.o === O.comma ? rawArgs.q : [rawArgs]) as readonly DeclareOp[]
       const isFn = top.v.length > 3, type = isFn ? ctx_[ctx_.length - 1].t & (T.block | T.prefix) ? "fn" : "fn _"
           : top.v as Exclude<typeof top.v, `fn ${string}`>
       values_.push(Op(O.fn, args.length ? args : null, val as ExprLikeOps | StorableBlockOp & { y: null }, Op(O.fnDesc
-          , type, isFn ? Op(O.ref, top.v.slice(3) as VarName, 0, 0) : null, null) as OpValues[O.fn]["y"]))
+          , type, isFn ? Op(O.ref, top.v.slice(3) as VarName, 0, 0) : null, null as never) as OpValues[O.fn]["y"]))
       } break
     case T.assign: /* T.assign: */ {
-      const y = values_.pop()!
-      if (y.o === O.composed) { throwSyntax("Unsupported destructuring assignment") }
-      values_.push(Op(O.assign, top.v, val as ExprLikeOps, y as ExprLikeOps))
+      values_[values_.length - 1] = Op(O.assign, top.v, val as ExprLikeOps, values_[values_.length - 1] as ExprLikeOps)
       } break
     case T.unary: case T.rightUnary: /* T.unary: T.rightUnary: */
       values_.push(Op(O.unary, top.v, val as ExprLikeOps, top.t > T.unary ? 1 : 0))
       break
     case T.callOrAccess: /* T.callOrAccess: */
-      if (!Build.NDEBUG && top.v !== "new") { throwSyntax(`Unexpected token: '${top.v}'`) }
       values_.push(val.o === O.call ? ((val as WritableOp<O.call>).y = "new", val)
           : Op(O.call, [], val as ExprLikeOps, "new"))
       break
     case T.dot: /* T.dot: */
-      Build.NDEBUG || val.o===O.literal && val.q===L.plain && typeof val.x === "string" || throwSyntax(`Fail: ${val.x}`)
-      values_.push(Op(O.access, top.v, values_.pop()! as ExprLikeOps, val.x as string))
+      Build.NDEBUG || val.o===O.literal && val.q===L.plain && typeof val.x === "string"
+          || throwSyntax(`Fail: ${JSON.stringify(val.x)}`)
+      values_[values_.length - 1] = Op(O.access, top.v, values_[values_.length - 1] as ExprLikeOps, val.x as string)
       break
     default:
-      values_.push(Op(O.binary,(top satisfies SomeTokens<BinaryTokens>).v,<ExprLikeOps>values_.pop()!,<ExprLikeOps>val))
+      values_[values_.length - 1] = Op(O.binary, (top satisfies SomeTokens<BinaryTokens>).v
+          , values_[values_.length - 1] as ExprLikeOps, val as ExprLikeOps)
       break
     }
   }
@@ -563,7 +568,7 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
       type = topIsDict ? T.dict : T.block,
       Build.NDEBUG || ((tokens_[pos_] as OverriddenToken).w = { n: topIsDict ? "dict" : "block", v: "{", t: type })
       ctx_.push(Token(type, "{"))
-      break
+      continue
     case T.blockEnd: case T.groupEnd: /* T.blockEnd | T.groupEnd: */
       before & (T.group | T.array | T.dict | (type === T.groupEnd ? T.semiColon : 0))
           ? values_.push(Op(O.comma, [], 0, 0)) : before === T.comma ? ctx_.length-- : 0
@@ -574,7 +579,7 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
       consume()
       topIsDict = ctx_[ctx_.length - (ctx_[ctx_.length - 1].t === T.comma ? 2 : 1)].t === T.dict
       type === T.blockEnd && values_[values_.length - 1].o === O.block && consumeUntil(~(T.prefix | T.action | T.fn))
-      break
+      continue
     case T.semiColon: /* T.semiColon: */ {
       const semiColon = cur.v === ";"
       // here doesn't check `T.group | T.array`
@@ -600,28 +605,28 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
       } else { // skip "\n"
         type = before, Build.NDEBUG || ((cur as Writable<BaseToken<T.semiColon>>).n = "not-SemiColon")
       }
-      } break
+      } continue
     case T.prefix: /* T.prefix: */
       consumeUntil(T.prefix | T.group | T.block)
       values_.push(Op(O.block, null as never, null, null)) // to recognize soft-semi easier
       ctx_.push(cur)
-      break
+      continue
     case T.action: /* T.action: */
       (pos_ > tokens_.length - 2 || tokens_[pos_ + 1].t & (T.blockEnd | T.semiColon))
           && "return,break,continue".includes(cur.v) && values_.push(Op(O.comma, [], 0, 0))
       consumeUntil(T.prefix | T.group | T.block); ctx_.push(cur)
-      break
+      continue
     case T.group: case T.array: /* T.group | T.array: */
       if (topIsDict) { type === T.group && ctx_.push(Token(T.colon, ":"), Token(T.fn, "(){")); topIsDict = false }
       else {
         ctx_[ctx_.length - 1].t & (T.dot | T.fn) && before !== T.fn && consume()
         if (before & (T.groupEnd | T.ref | T.literal)
             || before === T.blockEnd && (1 << values_[values_.length - 1].o) & (1 << O.composed | 1 << O.fn)) {
-          ctx_.push(Token(T.callOrAccess, "__call__"))
+          ctx_.push(Token(T.callOrAccess, "("))
         }
       }
       ctx_.push(cur)
-      break
+      continue
     case T.comma: /* T.comma: */
       if (before & (T.comma | T.array)) { values_.push(Op(O.literal, L.array_hole, null, 0)) }
       else if (before === T.groupEnd && values_[values_.length - 1].o === O.comma
@@ -631,7 +636,7 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
       while (ctx_[ctx_.length - 1].t >= T.comma) { consume() }
       ctx_[ctx_.length - 1].t === T.dict && (topIsDict = true)
       ctx_.push(cur)
-      break
+      continue
     case T.colon: /* T.colon: */
       if (before === T.ref) {
         const top = ctx_[ctx_.length - 1]
@@ -646,9 +651,13 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
         ctx_.push(cur), topIsDict = false
       } else {
         type = T.groupEnd, Build.NDEBUG || ((cur as OverriddenToken).w = Token(T.groupEnd, ")"))
-        "case default".includes(ctx_[ctx_.length - 1].v) && values_.push(Op(O.literal, L.plain, null, null))
+        const prefix = ctx_[ctx_.length - 1].v
+        if (prefix === "case" || prefix === "default") {
+          values_.push(Op(O.literal, L.plain, null, null))
+          consume()
+        }
       }
-      break
+      continue
     case T.fn: /* T.fn: */
       if (cur.v === "fn" && tokens_[pos_ + 1].t === T.ref) {
         ctx_.push(Token(T.fn, `fn ${(tokens_[++pos_] as BaseToken<T.ref>).v}`))
@@ -656,39 +665,54 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
         if (tokens_[pos_ + 1].v === "*") { throwSyntax("Unsupported generator") }
         ctx_.push(cur)
       }
-      break
+      continue
     case T.literal: /* T.literal: */ {
         const val = cur.v
         values_.push(typeof val === "object" && val ? Op(O.literal,val.q,val.x,val.y) : Op(O.literal,L.plain,val,null))
-      } break
+      } continue
     case T.ref: /* T.ref: */
       values_.push(Op(O.ref, cur.v as VarName, 0, 0))
-      break
-    default:
-      if (cur.t === T.callOrAccess && cur.v === "new" && tokens_[pos_ + 1].t === T.dot) {
+      continue
+    case T.callOrAccess: /* T.callOrAccess: */
+      if (!Build.NDEBUG && cur.v !== "new") { throwSyntax(`Unexpected token: '${cur.v}'`) }
+      if (tokens_[pos_ + 1].t === T.dot) {
         values_.push(Op(O.ref, "new.target", 0, 0))
         pos_ += 2
-      } else {
-        if (cur.t === T.math1 && before === T.blockEnd
+        type = T.ref
+        continue
+      }
+      break
+    case T.math1: /* T.math1 */
+      if (before === T.blockEnd
             && !(1 << values_[values_.length - 1].o & (1 << O.composed | 1 << O.fn))) {
           cur = Token(type = T.unary, cur.v as TokenValues[T.math1])
           Build.NDEBUG || ((tokens_[pos_] as OverriddenToken).w = cur)
-        } else if (cur.t === T.compare2 && cur.v === "in") {
+      }
+      break
+    case T.compare2: /* T.compare2 */
+      if (cur.v === "in") {
           const t1 = ctx_[ctx_.length - (ctx_[ctx_.length - 1].t === T.group ? 2 : 1)]
           if (t1.t === T.action ? isVarAction(t1.v) : t1.t === T.prefix && t1.v === "for"
               && values_[values_.length - 2].o === O.block) {
             cur = Token(type = T.assign, "in"), Build.NDEBUG || ((tokens_[pos_] as OverriddenToken).w = cur)
           }
-        } else if (cur.t === T.dot && tokens_[pos_ + 1].t & (T.group | T.array)) {
+      }
+      break
+    case T.dot: /* T.dot */
+      if (tokens_[pos_ + 1].t & (T.group | T.array)) {
           cur = Token(type = T.callOrAccess, "?."), Build.NDEBUG || ((tokens_[pos_] as OverriddenToken).w = cur)
-        }
+      }
+      break
+    default:
+      if (0) { cur.t satisfies T.question | T.assign | T.or | T.and | T.bitOr | T.bitXor | T.bitAnd | T.compare1
+          | T.bitMove | T.math2 | T.math3 | T.unary | T.rightUnary }
+    }
+    {
         const kOpL2R = T.comma | T.bitOr | T.bitXor | T.bitAnd | T.compare1 | T.compare2 | T.bitMove
             | T.math1 | T.math2 | T.math3 | T.dot
         consumeUntil((type & (T.question | T.colon | T.fn | T.assign) ? T.assign << 1
             : type & kOpL2R ? type : type << 1) - 1)
         ctx_.push(cur)
-      }
-      break
     }
   }
   }
@@ -700,8 +724,18 @@ const parseTree = (tokens_: readonly Token[], inNewFunc: boolean | null | undefi
 const getEscapeAnalyser = (): (func: BaseOp<O.fn>) => void => {
   interface WritableTempBlockOp extends Pick<BaseOp<O.block>, "o" | "q"> {
       /** consts */ x: VarName[] | null, /** lets */ y: VarName[] | null }
-  const ToVarNames = (out: VarName[], ops: readonly DeclareOp[]): VarName[] => {
-    for (const op of ops) { out.push(op.o === O.ref ? op.q : op.y.q) }
+  const ToVarNames = (out: VarName[], ops: readonly (DeclareOp | DestructurePairOp | ArrayHoleOp)[]): VarName[] => {
+    for (let op of ops) {
+      op = op.o === O.pair ? op.x : op
+      if (op.o === O.ref) {
+        out.push(op.q)
+      } else if (op.o === O.literal) { /* empty */ }
+      else if (op.y.o === O.ref) {
+        out.push(op.y.q)
+      } else {
+        ToVarNames(out, op.y.q)
+      }
+    }
     return out
   }
   const preScanFnBody = (pureVars: VarName[], block: WritableTempBlockOp | BaseOp<O.stats>): void => {
@@ -750,7 +784,7 @@ const getEscapeAnalyser = (): (func: BaseOp<O.fn>) => void => {
     _scopes.push(scope)
     return scope
   }
-  const exitScope = (op: Omit<BaseOp<O.block>, "q"> | RefOp | BaseOp<O.fnDesc>): void => {
+  const exitScope = (op: Omit<BaseOp<O.block>, "q"> | RefOp | BaseOp<O.fnDesc> | DestructuringComposedOp): void => {
     const declarations = _scopes.pop()!, level = _scopes.length, referred = op.o === O.ref ? declarations[0].x.q : null
     declarations.sort((a, b): number => a.o - b.o)
     let i = 0, numbers: [number, number, number, number, number, number, number] = [0, 0, 0, 0, 0, 0, 0]
@@ -764,9 +798,13 @@ const getEscapeAnalyser = (): (func: BaseOp<O.fn>) => void => {
     }
     let [n1, n2, n3, n4, n5, n6] = numbers
     n2 += n1, n3 += n2, n4 += n3, n5 += n4, n6 += n5
-    op.o === O.ref ? ((op as WritableOp<O.ref>).x = referred!.length ? 0 : -1, (op as WritableOp<O.ref>).y = n1)
-    : (declarations.length = n6, (op as WritableOp<O.block> | WritableOp<O.fnDesc>).y = {
-        t: [n1,n2,n3,n4,n5,n6], v: declarations.map(i => i.y) })
+    if (op.o === O.ref) {
+      (op satisfies RefOp as WritableOp<O.ref>).x = n1, (op as WritableOp<O.ref>).y = referred!.length ? 0 : -1
+    } else {
+      declarations.length = n6
+      ; (op satisfies Omit<BaseOp<O.block>, "q">|BaseOp<O.fnDesc>|DestructuringComposedOp as Writable<typeof op>).y = {
+          t: [n1, n2, n3, n4, n5, n6], v: declarations.map(i => i.y) }
+    }
   }
   const kFnBuiltinVars: VarList = ["this", "arguments", "new.target"]
   const visit = (op: EvaluatableOps | PairOp): void => {
@@ -793,10 +831,10 @@ const getEscapeAnalyser = (): (func: BaseOp<O.fn>) => void => {
         }
         return
       } else if (op.q === "catch" && op.x) {
-        Scope(null, ToVarNames([], [op.x]))
+        Scope(null, ToVarNames([], op.x.o === O.ref ? [op.x] : op.x.q))
         visit(op.x)
         visit(op.y)
-        exitScope(op.x satisfies RefOp)
+        exitScope(op.x satisfies RefOp | DestructuringComposedOp)
         return
       }
       break
@@ -831,16 +869,17 @@ const getEscapeAnalyser = (): (func: BaseOp<O.fn>) => void => {
         ; (block as typeof op.x as WritableOp<O.block>).x = (block as WritableTempBlockOp).x?.[0] === kDots ? 1 : 0
         ; (block as typeof op.x as Writable<typeof op.x>).y = !builtins || (b0.o + b1.o + b2.o === V.unused * 3) ? null
             : [ scope.indexOf(b0), scope.indexOf(b1), scope.indexOf(b2) ]
-      } else if (op.q) {
-        Scope(null, ToVarNames([], op.q))
-        op.q.forEach(visit)
+      } else {
+        Scope(null, op.q ? ToVarNames([], op.q) : [])
+        op.q?.forEach(visit)
         visit(op.x)
         exitScope(op.y satisfies BaseOp<O.fnDesc>)
-      } else {
-        visit(op.x)
       }
       _cur_fn--
       op.y.q.length > 3 && exitScope((op as ConcreteFnOp<"fn _">).y.x satisfies RefOp)
+      return
+    case O.composed:
+      op.q.forEach(visit)
       return
     case O.literal:
       return
@@ -876,6 +915,17 @@ const throwReference = (name: string | number, isLocal: boolean): never => {
 const throwType = (error: string): never => { throw new TypeError(error) }
 const newException = (noHandler?: 1): NonNullable<typeof g_exc> =>
     g_exc = { g: isolate_, l: locals_.slice(0), d: noHandler ? stackDepth_ : -stackDepth_ }
+
+const StackFrameFromComposedOp = (newVar: RefOp | DestructuringComposedOp, val: unknown
+    , parentOp: RefAssignOp | null): void => {
+  if (newVar.o === O.ref) {
+    const elet = newVar.x!
+    StackFrame({ t: [0, elet, elet, elet, 1, 1], v: [newVar.q] }, [newVar.y, val])
+  } else {
+    StackFrame(newVar.y)
+    evalDestructuring(newVar, val, parentOp)
+  }
+}
 
 const StackFrame = (analysed: AnalysedVars, defined?: readonly unknown[] | null, scopeName?: string): StackFrame|void=>{
   const varDict: VarBindings = []
@@ -948,10 +998,9 @@ const evalTry = (stats: readonly EvaluatableOps[], i: number): TryValue => {
     catch (ex) {
       g_exc || newException()
       exitFrame(locals_.length - oldLocalsPos)
-      const newVar = next.x, elet = newVar?.y
-      newVar && StackFrame({ t: [0, elet!, elet!, elet!, 1, 1], v: [newVar.q] }, [newVar.x, ex])
+      next.x && StackFrameFromComposedOp(next.x, ex, null)
       res = evalBlockBody(next.y)
-      newVar && exitFrame(1); g_exc = null; done = 1
+      next.x && exitFrame(1); g_exc = null; done = 1
     }
   } finally { if (indFinal) {
     const oldLocals = locals_, oldExc = done ? null : g_exc || newException()
@@ -983,7 +1032,7 @@ const evalFor = (statement: BaseStatementOp<"for">, labels: NullableVarList): St
     locals_.push({ o: newVars, q: old.q, x: old.x, y: old.y })
     return newVars
   }
-  let res: StatValue = kEmptyValue, ref: Writable<Ref>
+  let res: StatValue = kEmptyValue, ref: Writable<Ref> | null
   analysedScope && StackFrame(analysedScope)
   if (statement.x.q.length === 3) {
     initOp.o === O.stat ? evalLet(initOp.q, initOp.y.q, null) : opEvals[initOp.o](initOp)
@@ -995,31 +1044,26 @@ const evalFor = (statement: BaseStatementOp<"for">, labels: NullableVarList): St
   } else {
     const assignment = (initOp.o === O.stat ? initOp.y.q[0] : initOp) as RefAssignOp
     const source = opEvals[assignment.x.o](assignment.x) as number[] | string | null | undefined
-    ref = Ref(assignment.y, analysedScope ? R.eveNotInited : R.plain)
+    ref = assignment.y.o === O.composed ? null : _resolveVarRef(assignment.y, analysedScope ? R.eveNotInited : R.plain)
     if (assignment.q === "in") {
       for (let item in source as { [k: number]: unknown }) {
-        ref.y[ref.i] = item as string | number as number
+        ref ? (ref.y[ref.i] = item as string | number as number)
+            : evalDestructuring(assignment.y as DestructuringComposedOp, item, assignment)
         body.o <= O.stat ? res = evalBlockBody(SubBlock(body as StatLikeOps)) : opEvals[body.o](body)
         if ((res = consumeContinue(res, labels)) !== kEmptyValue) { break }
-        analysedScope && (ref.y = forkScope() satisfies unknown[] as number[])
+        analysedScope && (ref ? (ref.y = forkScope() satisfies unknown[] as number[]) : forkScope())
       }
     } else {
-      let iterator: Iterator<number>, cur: IteratorResult<number> | undefined, ind = 0
-      if (Build.BTypes & BrowserType.Chrome && Build.MinCVer < BrowserVer.MinEnsuredES6$ForOf$Map$SetAnd$Symbol
-          && !kIterator) {
-        if (!source ? source !== "" : source.length == null) {
-              throwType(DebugCallee(assignment.x, null, "") + " is not iterable") }
-      } else {
-        const it = isLooselyNull(source) ? source : source[kIterator!]
-        if (typeof it !== "function") { throwType(DebugCallee(assignment.x, null, "") + " is not iterable") }
-        iterator = (HasReflect ? Reflect!.apply(it!, source!, []) : evalCall.call.call(it!, source!))as Iterator<number>
-      }
+      let iterator = evalIter(source, assignment.x), cur: IteratorResult<number> | undefined, ind = 0
       while ((res = consumeContinue(res, labels)) === kEmptyValue
           && (Build.BTypes & BrowserType.Chrome && Build.MinCVer < BrowserVer.MinEnsuredES6$ForOf$Map$SetAnd$Symbol
               && !kIterator ? ind < source!.length : (cur = iterator!.next(), !cur.done))) {
-        ref.y[ref.i] = cur ? cur.value : source![ind]
+        const item = Build.BTypes & BrowserType.Chrome && Build.MinCVer<BrowserVer.MinEnsuredES6$ForOf$Map$SetAnd$Symbol
+              && !kIterator ? source![ind] : cur!.value
+        ref ? (ref.y[ref.i] = item as string | number as number)
+            : evalDestructuring(assignment.y as DestructuringComposedOp, item, assignment)
         body.o <= O.stat ? res = evalBlockBody(SubBlock(body as StatLikeOps)) : opEvals[body.o](body)
-        analysedScope && (ref.y = forkScope() satisfies unknown[] as number[])
+        analysedScope && (ref ? (ref.y = forkScope() satisfies unknown[] as number[]) : forkScope())
         ind++
       }
     }
@@ -1028,18 +1072,106 @@ const evalFor = (statement: BaseStatementOp<"for">, labels: NullableVarList): St
   return res
 }
 
+const evalIter = (source: number[] | string | null | undefined, sourceOp: ExprLikeOps): Iterator<number> | void => {
+  if (Build.BTypes & BrowserType.Chrome && Build.MinCVer < BrowserVer.MinEnsuredES6$ForOf$Map$SetAnd$Symbol
+      && !kIterator) {
+    if (!source ? source !== "" : source.length == null) {
+          throwType(DebugCallee(sourceOp, null, "") + " is not iterable") }
+  } else {
+    const it = isLooselyNull(source) ? source : source[kIterator!]
+    if (typeof it !== "function") { throwType(DebugCallee(sourceOp, null, "") + " is not iterable") }
+    return (HasReflect ? Reflect!.apply(it!, source!, []) : evalCall.call.call(it!, source!))as Iterator<number>
+  }
+}
+
 const evalLet = (action: VarActions | "arg", declarations: readonly DeclareOp[], args: unknown[] | null): void => {
   const appendUndefined = action === "arg" || action === "let"
-  let bindings = action === "var" ? null : locals_[locals_.length - 1].o, op: DeclareOp, varPos: number, ind = -1
+  let bindings = action === "var" ? null : locals_[locals_.length - 1].o, op: DeclareOp, ind = -1
   for (op of declarations) {
     ind++
-    varPos = (op.o === O.assign ? op.y : op.q !== kDots ? op : (declarations[ind + 1] as RefOp)).y!
-    if (args !== null && op.o === O.ref && op.q === kDots) { bindings![varPos] = args.slice(ind); break }
-    if (args !== null && ind < args.length && args[ind] !== void 0) { bindings![varPos] = args[ind] }
-    else if (op.o !== O.assign) { appendUndefined && (bindings![varPos] = void 0) }
-    else {
-      (bindings ??= locals_[op.y.x!].o)[varPos] = op.x.o === O.fn
+    if (args !== null && op.o === O.ref && op.q === kDots) {
+      bindings![(declarations[ind + 1] as RefOp).y!] = args.slice(ind)
+      break
+    }
+    if (args !== null && ind < args.length && args[ind] !== void 0) {
+      op.o === O.assign ? op.y.o === O.composed ? evalDestructuring(op.y, args[ind], null)
+          : (bindings![op.y.y!] = args[ind]) : (bindings![(op satisfies RefOp).y!] = args[ind])
+    }
+    else if (op.o === O.ref) { appendUndefined && (bindings![op.y!] = void 0) }
+    else if (op.y.o === O.composed) {
+      evalDestructuring(op.y, opEvals[op.x.o](op.x), op)
+    } else {
+      (bindings ??= locals_[op.y.x!].o)[op.y.y!] = op.x.o === O.fn
           ? FunctionFromOp(op.x, isolate_, locals_, op.y.q) : opEvals[op.x.o](op.x)
+    }
+  }
+}
+
+const evalDestructuring = (destructOp: DestructuringComposedOp, composed_value: any, parentOp: RefAssignOp|null):void=>{
+  if (destructOp.x === "[") {
+    let index = 0, iterator = evalIter(composed_value, parentOp ? parentOp.x : )
+    for (const op of destructOp.q) {
+      if (op.o === O.ref && op.q === kDots) {
+        const { y, i } = _resolveVarRef(destructOp.q[index + 1] as RefOp, R.eveNotInited)
+        y[i] = [].slice.call(composed_value, index) as unknown as number
+        break
+      }
+      if (op.o === O.literal) {
+        if (0) { op.q satisfies L.array_hole }
+        
+        continue
+      }
+      const keyOp = op.o === O.ref ? op.q : op.o === O.assign ? op.y.o === O.ref ? op.y.q : index : op.q
+      const key: string | number | symbol = evalAccessKey(typeof keyOp === "object" ? opEvals[keyOp.o](keyOp) : keyOp)
+      const target: DeclareOp = op.o === O.pair ? op.x : op
+      let value = composed_value[key]
+      const useDefault = value === void 0 && target.o === O.assign
+      if (useDefault) {
+        value = opEvals[target.x.o](target.x)
+      }
+      const ref = target.o === O.ref ? _resolveVarRef(target, R.eveNotInited)
+          : target.y.o === O.ref ? _resolveVarRef(target.y, R.eveNotInited)
+          : null
+      if (ref !== null) {
+        ref.y[ref.i] = value
+      } else {
+        evalDestructuring((target as Exclude<typeof target, RefOp> & { y: BaseOp<O.composed> }).y, value
+            , useDefault ? target : Op(O.assign, "=", Op(O.access, "["
+                  , parentOp ? parentOp.x : Op(O.ref, `(${kDots})` as VarName, 0, 0)
+                  , typeof keyOp === "object" ? keyOp : Op(O.literal, L.plain, keyOp, null))
+                , target.y as DestructuringComposedOp) as RefAssignOp)
+      }
+      index++
+    }
+
+  } else {
+    const visited = new Map2<string, 1>()
+    for (const op of destructOp.q) {
+      if (op.o === O.ref && op.q === kDots) {
+        // @todo
+        break
+      }
+      const keyOp: string | ExprLikeOps = op.o === O.ref ? op.q : op.o === O.assign ? op.y.q : op.q
+      const key: string | number | symbol = evalAccessKey(typeof keyOp === "object" ? opEvals[keyOp.o](keyOp) : keyOp)
+      const target: DeclareOp = op.o === O.pair ? op.x : op
+      let value = composed_value[key]
+      const useDefault = value === void 0 && target.o === O.assign
+      if (useDefault) {
+        value = opEvals[target.x.o](target.x)
+      }
+      const ref = target.o === O.ref ? _resolveVarRef(target, R.eveNotInited)
+          : target.y.o === O.ref ? _resolveVarRef(target.y, R.eveNotInited)
+          : null
+      if (ref !== null) {
+        ref.y[ref.i] = value
+      } else {
+        evalDestructuring((target as Exclude<typeof target, RefOp> & { y: BaseOp<O.composed> }).y, value
+            , useDefault ? target : Op(O.assign, "=", Op(O.access, "["
+                  , parentOp ? parentOp.x : Op(O.ref, `(${kDots})` as VarName, 0, 0)
+                  , typeof keyOp === "object" ? keyOp : Op(O.literal, L.plain, keyOp, null))
+                , target.y as DestructuringComposedOp) as RefAssignOp)
+      }
+      visited.set(key as string, 1)
     }
   }
 }
@@ -1150,8 +1282,8 @@ const evalNever = (op: BaseOp<KStatLikeO | O.pair | O.fnDesc>): void => {
 }, evalFn = (op: BaseOp<O.fn>): unknown => {
   return FunctionFromOp(op, isolate_, locals_, "")
 }, evalAssign = (op: BaseOp<O.assign>): unknown => {
-  const action = op.q, target = op.y as RefOp | BaseOp<O.access>, direct = action === "="
-  const { y, i } = Ref(target, direct ? R.evenNeitherInitedNorFound : R.plain)
+  const action = op.q, target = op.y as RefOp | DestructuringComposedOp | BaseOp<O.access>, direct = action === "="
+  const { y, i } = target.o !== O.composed ? Ref(target, direct ? R.evenNeitherInitedNorFound : R.plain) : { y:[0],i:0 }
   let x: number = direct ? 0 : y[i]
   if (action === "??=" ? !isLooselyNull(x) : action === "||=" ? x : action === "&&=" ? !x : false) { return x }
   const source = op.x.o !== O.fn ? opEvals[op.x.o](op.x) as number : FunctionFromOp(op.x
@@ -1164,7 +1296,8 @@ const evalNever = (op: BaseOp<KStatLikeO | O.pair | O.fnDesc>): void => {
   default   : x   = source;
     if (0) { action satisfies "=" | "??=" | "&&=" | "||=" | "of" | "in" } break // lgtm [js/unreachable-statement]
   }
-  if (target.o === O.ref && target.x! >= 0) {
+  if (target.o === O.composed) { evalDestructuring(target, source, op as RefAssignOp) }
+  else if (target.o === O.ref && target.x! >= 0) {
     const analysed = locals_[target.x!].q
     if (target.y! < analysed[V.econst] || target.y! >= analysed[V.locall]) {
       throwType(`Assignment to constant variable '${target.q}'.`)
@@ -1333,7 +1466,7 @@ const FunctionFromOp = (fn: BaseOp<O.fn>, globals: Isolate, closures: StackFrame
   const callable = function (this: unknown): unknown {
     const oldIsolate = isolate_, oldLocals = locals_
     const type = fn.y.q, block = fn.x.o === O.block ? fn.x : null, builtins = block?.y
-    let frame: StackFrame | null | void, done = false
+    let frame: StackFrame | void, done = false
     const newTarget = !(builtins && builtins[2] >= 0 || type < "f") ? void 0
         : Build.BTypes & BrowserType.Chrome && Build.MinCVer < BrowserVer.MinEnsuredES6NewTarget
         ? this instanceof callable ? callable : void 0 : new.target
@@ -1341,9 +1474,8 @@ const FunctionFromOp = (fn: BaseOp<O.fn>, globals: Isolate, closures: StackFrame
     isolate_ = globals, locals_ = closures.slice(), g_exc = g_exc && g_exc.d < 0 ? g_exc : null
     const oldLocalsPos = locals_.length
     const stdArgs = fn.q || builtins && builtins[1] >= 0 ? arguments : void 0
-    const newVar = type.length > 3 ? (fn as ConcreteFnOp<"fn _">).y.x : null, elet = newVar?.y
-    newVar && StackFrame({ t: [0, elet!, elet!, elet!, 1, 1], v: [newVar.q] }, [newVar.x, callable])
-    frame = fn.y.y && StackFrame(fn.y.y, builtins && [builtins[0], builtins[0] >= 0 ? this : void 0
+    type.length > 3 && StackFrameFromComposedOp((fn as ConcreteFnOp<"fn _">).y.x, callable, null)
+    frame = StackFrame(fn.y.y, builtins && [builtins[0], builtins[0] >= 0 ? this : void 0
         , builtins[1], stdArgs, builtins[2], newTarget], stdName)
     ++stackDepth_
     try {
@@ -1355,7 +1487,7 @@ const FunctionFromOp = (fn: BaseOp<O.fn>, globals: Isolate, closures: StackFrame
     } finally {
       done ? g_exc && g_exc.d > 0 && (g_exc = null) : g_exc && g_exc.d >= stackDepth_ || newException(1)
       stackDepth_--
-      !Build.NDEBUG && done && frame !== null && (locals_[locals_.length - 1] !== frame)
+      !Build.NDEBUG && done && (locals_[locals_.length - 1] !== frame)
           && console.log("Vimium C found a bug of stack error when calling `" + (stdName || "anonymous") + "(...)`")
       exitFrame(locals_.length - oldLocalsPos)
       isolate_ = oldIsolate, locals_ = oldLocals
